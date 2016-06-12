@@ -72,7 +72,7 @@
 /****************************************************************************
  * Pre-processor Definitions
  ****************************************************************************/
-//#define CONFIG_SPI_OWNBUS 1
+#define CONFIG_SPI_OWNBUS 1
 
 #ifndef CONFIG_WL_NRF24L01_DFLT_ADDR_WIDTH
 #  define CONFIG_WL_NRF24L01_DFLT_ADDR_WIDTH 5
