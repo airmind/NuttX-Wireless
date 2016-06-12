@@ -72,6 +72,7 @@
 /****************************************************************************
  * Pre-processor Definitions
  ****************************************************************************/
+//#define CONFIG_SPI_OWNBUS 1
 
 #ifndef CONFIG_WL_NRF24L01_DFLT_ADDR_WIDTH
 #  define CONFIG_WL_NRF24L01_DFLT_ADDR_WIDTH 5
@@ -263,11 +264,10 @@ static void nrf24l01_lock(FAR struct spi_dev_s *spi)
    * unlocked)
    */
 
-  SPI_SELECT(spi, SPIDEV_WIRELESS, true);
-  SPI_SETMODE(spi, SPIDEV_MODE0);
-  SPI_SETBITS(spi, 8);
   SPI_SETFREQUENCY(spi, NRF24L01_SPIFREQ);
-  SPI_SELECT(spi, SPIDEV_WIRELESS, false);
+  SPI_SETBITS(spi, 8);
+  SPI_SETMODE(spi, SPIDEV_MODE0);
+
 }
 #endif
 
@@ -347,6 +347,7 @@ static uint8_t nrf24l01_access(FAR struct nrf24l01_dev_s *dev,
 {
   uint8_t status;
 
+  nrf24l01_lock(dev->spi);
   /* Prepare SPI */
 
   nrf24l01_select(dev);
@@ -370,6 +371,8 @@ static uint8_t nrf24l01_access(FAR struct nrf24l01_dev_s *dev,
     }
 
   nrf24l01_deselect(dev);
+
+  nrf24l01_unlock(dev->spi);
   return status;
 }
 
@@ -510,7 +513,7 @@ static int nrf24l01_irqhandler(int irq, FAR void *context)
 {
   FAR struct nrf24l01_dev_s *dev = g_nrf24l01dev;
 
-  wllvdbg("*IRQ*");
+  wllvdbg("*IRQ*\n");
 
 #ifdef CONFIG_WL_NRF24L01_RXSUPPORT
 
@@ -556,12 +559,11 @@ static void nrf24l01_worker(FAR void *arg)
   uint8_t status;
   uint8_t fifo_status;
 
-  nrf24l01_lock(dev->spi);
-
   status = nrf24l01_readregbyte(dev, NRF24L01_STATUS);
 
   if (status & NRF24L01_RX_DR)
     {
+      bool recv_err = false;
       /* put CE low */
 
       bool ce = nrf24l01_chipenable(dev, false);
@@ -584,12 +586,23 @@ static void nrf24l01_worker(FAR void *arg)
 
           pipeno = (status & NRF24L01_RX_P_NO_MASK) >> NRF24L01_RX_P_NO_SHIFT;
 
+          if (pipeno >= NRF24L01_PIPE_COUNT) {
+            recv_err = true;
+            break;
+          }
+
           pktlen = dev->pipedatalen[pipeno];
           if (NRF24L01_DYN_LENGTH == pktlen)
             {
               /* If dynamic length payload need to use R_RX_PL_WID command to get actual length */
 
               nrf24l01_access(dev, MODE_READ, NRF24L01_R_RX_PL_WID, &pktlen, 1);
+              if (pktlen > NRF24L01_MAX_PAYLOAD_LEN) {
+                nrf24l01_flush_rx(dev);
+                recv_err = true;
+                wdbg("recv data error!\n");
+                break;
+              }
             }
 
           /* Get payload content */
@@ -615,7 +628,7 @@ static void nrf24l01_worker(FAR void *arg)
       nrf24l01_chipenable(dev, ce);
 
 #ifndef CONFIG_DISABLE_POLL
-      if (dev->pfd)
+      if (!recv_err && dev->pfd)
         {
           dev->pfd->revents |= POLLIN;  /* Data available for input */
 
@@ -638,7 +651,6 @@ static void nrf24l01_worker(FAR void *arg)
 
       nrf24l01_chipenable(dev, true);
     }
-  nrf24l01_unlock(dev->spi);
 }
 
 #endif
@@ -707,10 +719,6 @@ static int dosend(FAR struct nrf24l01_dev_s *dev, FAR const uint8_t *data, size_
 
   nrf24l01_chipenable(dev, true);
 
-  /* Free the SPI bus during the IRQ wait */
-
-  nrf24l01_unlock(dev->spi);
-
   /* Wait for IRQ  (TX_DS or MAX_RT) */
 
   while (sem_wait(&dev->sem_tx) != 0)
@@ -723,8 +731,6 @@ static int dosend(FAR struct nrf24l01_dev_s *dev, FAR const uint8_t *data, size_
     }
 
   /* Re-acquire the SPI bus */
-
-  nrf24l01_lock(dev->spi);
 
   status = nrf24l01_readreg(dev, NRF24L01_OBSERVE_TX, &obsvalue, 1);
   if (status & NRF24L01_TX_DS)
@@ -1292,7 +1298,6 @@ int nrf24l01_init(FAR struct nrf24l01_dev_s *dev)
   uint8_t features;
 
   CHECK_ARGS(dev);
-  nrf24l01_lock(dev->spi);
 
   /* Configure the SPI parameters now  (if we own the bus) */
 
@@ -1353,7 +1358,6 @@ int nrf24l01_init(FAR struct nrf24l01_dev_s *dev)
   nrf24l01_writeregbyte(dev, NRF24L01_STATUS, NRF24L01_RX_DR|NRF24L01_TX_DS|NRF24L01_MAX_RT);
 
 out:
-  nrf24l01_unlock(dev->spi);
   return result;
 }
 
@@ -1369,9 +1373,7 @@ int nrf24l01_setpipeconfig(FAR struct nrf24l01_dev_s *dev, unsigned int pipeno,
 
   /* Need to enable AA to enable dynamic length payload */
 
-  en_aa = dynlength || pipecfg->en_aa;
-
-  nrf24l01_lock(dev->spi);
+  en_aa = pipecfg->en_aa;
 
   /* Set addr  */
 
@@ -1398,7 +1400,6 @@ int nrf24l01_setpipeconfig(FAR struct nrf24l01_dev_s *dev, unsigned int pipeno,
     {
       nrf24l01_writeregbyte(dev, NRF24L01_RX_PW_P0 + pipeno, pipecfg->payload_length);
     }
-  nrf24l01_unlock(dev->spi);
 
   dev->pipedatalen[pipeno] = pipecfg->payload_length;
   return OK;
@@ -1410,8 +1411,6 @@ int nrf24l01_getpipeconfig(FAR struct nrf24l01_dev_s *dev, unsigned int pipeno,
   bool dynlength;
 
   CHECK_ARGS(dev && pipecfg && pipeno < NRF24L01_PIPE_COUNT);
-
-  nrf24l01_lock(dev->spi);
 
   /* Get pipe address  */
 
@@ -1435,8 +1434,6 @@ int nrf24l01_getpipeconfig(FAR struct nrf24l01_dev_s *dev, unsigned int pipeno,
       pipecfg->payload_length = nrf24l01_readregbyte(dev, NRF24L01_RX_PW_P0 + pipeno);
     }
 
-  nrf24l01_unlock(dev->spi);
-
   return OK;
 }
 
@@ -1446,8 +1443,6 @@ int nrf24l01_enablepipe(FAR struct nrf24l01_dev_s *dev, unsigned int pipeno, boo
 
   uint8_t rxaddrval;
   uint8_t pipemask = 1 << pipeno;
-
-  nrf24l01_lock(dev->spi);
 
   /* Enable pipe on nRF24L01 */
 
@@ -1463,7 +1458,6 @@ int nrf24l01_enablepipe(FAR struct nrf24l01_dev_s *dev, unsigned int pipeno, boo
     }
 
   nrf24l01_writeregbyte(dev, NRF24L01_EN_RXADDR, rxaddrval);
-  nrf24l01_unlock(dev->spi);
 
   /* Update cached value */
 
@@ -1476,10 +1470,7 @@ int nrf24l01_settxaddr(FAR struct nrf24l01_dev_s *dev, FAR const uint8_t *txaddr
 {
   CHECK_ARGS(dev && txaddr);
 
-  nrf24l01_lock(dev->spi);
-
   nrf24l01_writereg(dev, NRF24L01_TX_ADDR, txaddr, dev->addrlen);
-  nrf24l01_unlock(dev->spi);
   return OK;
 }
 
@@ -1487,10 +1478,7 @@ int nrf24l01_gettxaddr(FAR struct nrf24l01_dev_s *dev, FAR uint8_t *txaddr)
 {
   CHECK_ARGS(dev && txaddr);
 
-  nrf24l01_lock(dev->spi);
-
   nrf24l01_readreg(dev, NRF24L01_TX_ADDR, txaddr, dev->addrlen);
-  nrf24l01_unlock(dev->spi);
   return OK;
 }
 
@@ -1502,10 +1490,7 @@ int nrf24l01_setretransmit(FAR struct nrf24l01_dev_s *dev, nrf24l01_retransmit_d
 
   val = (retrdelay << NRF24L01_ARD_SHIFT) | (retrcount << NRF24L01_ARC_SHIFT);
 
-  nrf24l01_lock(dev->spi);
-
   nrf24l01_writeregbyte(dev, NRF24L01_SETUP_RETR, val);
-  nrf24l01_unlock(dev->spi);
   return OK;
 }
 
@@ -1544,15 +1529,12 @@ int nrf24l01_settxpower(FAR struct nrf24l01_dev_s *dev, int outpower)
       return -EINVAL;
   }
 
-  nrf24l01_lock(dev->spi);
-
   value = nrf24l01_readregbyte(dev, NRF24L01_RF_SETUP);
 
   value &= ~(NRF24L01_RF_PWR_MASK);
   value |= hwpow;
 
   nrf24l01_writeregbyte(dev, NRF24L01_RF_SETUP, value);
-  nrf24l01_unlock(dev->spi);
   return OK;
 }
 
@@ -1561,10 +1543,7 @@ int nrf24l01_gettxpower(FAR struct nrf24l01_dev_s *dev)
   uint8_t value;
   int powers[] = { -18, -12, -6, 0};
 
-  nrf24l01_lock(dev->spi);
-
   value = nrf24l01_readregbyte(dev, NRF24L01_RF_SETUP);
-  nrf24l01_unlock(dev->spi);
 
   value = (value & NRF24L01_RF_PWR_MASK) >> NRF24L01_RF_PWR_SHIFT;
   return powers[value];
@@ -1573,8 +1552,6 @@ int nrf24l01_gettxpower(FAR struct nrf24l01_dev_s *dev)
 int nrf24l01_setdatarate(FAR struct nrf24l01_dev_s *dev, nrf24l01_datarate_t datarate)
 {
   uint8_t value;
-
-  nrf24l01_lock(dev->spi);
 
   value = nrf24l01_readregbyte(dev, NRF24L01_RF_SETUP);
   value &= ~(NRF24L01_RF_DR_HIGH | NRF24L01_RF_DR_LOW);
@@ -1594,7 +1571,6 @@ int nrf24l01_setdatarate(FAR struct nrf24l01_dev_s *dev, nrf24l01_datarate_t dat
     }
 
   nrf24l01_writeregbyte(dev, NRF24L01_RF_SETUP, value);
-  nrf24l01_unlock(dev->spi);
   return OK;
 }
 
@@ -1604,10 +1580,8 @@ int nrf24l01_setradiofreq(FAR struct nrf24l01_dev_s *dev, uint32_t freq)
 
   CHECK_ARGS(dev && freq >= NRF24L01_MIN_FREQ && freq <= NRF24L01_MAX_FREQ);
 
-  value = NRF24L01_MIN_FREQ - freq;
-  nrf24l01_lock(dev->spi);
+  value = freq - NRF24L01_MIN_FREQ;
   nrf24l01_writeregbyte(dev, NRF24L01_RF_CH, value);
-  nrf24l01_unlock(dev->spi);
   return OK;
 }
 
@@ -1617,9 +1591,7 @@ uint32_t nrf24l01_getradiofreq(FAR struct nrf24l01_dev_s *dev)
 
   CHECK_ARGS(dev);
 
-  nrf24l01_lock(dev->spi);
   rffreq = (int)nrf24l01_readregbyte(dev, NRF24L01_RF_CH);
-  nrf24l01_unlock(dev->spi);
 
   return rffreq + NRF24L01_MIN_FREQ;
 }
@@ -1628,18 +1600,14 @@ int nrf24l01_setaddrwidth(FAR struct nrf24l01_dev_s *dev, uint32_t width)
 {
   CHECK_ARGS(dev && width <= NRF24L01_MAX_ADDR_LEN && width >= NRF24L01_MIN_ADDR_LEN);
 
-  nrf24l01_lock(dev->spi);
   nrf24l01_writeregbyte(dev, NRF24L01_SETUP_AW, width-2);
-  nrf24l01_unlock(dev->spi);
   dev->addrlen = width;
   return OK;
 }
 
 int nrf24l01_changestate(FAR struct nrf24l01_dev_s *dev, nrf24l01_state_t state)
 {
-  nrf24l01_lock(dev->spi);
   nrf24l01_tostate(dev, state);
-  nrf24l01_unlock(dev->spi);
   return OK;
 }
 
@@ -1649,11 +1617,8 @@ int nrf24l01_send(FAR struct nrf24l01_dev_s *dev, FAR const uint8_t *data, size_
 
   CHECK_ARGS(dev && data && datalen <= NRF24L01_MAX_PAYLOAD_LEN);
 
-  nrf24l01_lock(dev->spi);
-
   result = dosend(dev, data, datalen);
 
-  nrf24l01_unlock(dev->spi);
   return result;
 }
 
@@ -1662,8 +1627,6 @@ int nrf24l01_sendto(FAR struct nrf24l01_dev_s *dev, FAR const uint8_t *data,
 {
   bool pipeaddrchg = false;
   int result;
-
-  nrf24l01_lock(dev->spi);
 
   /* If AA is enabled (pipe 0 is active and its AA flag is set) and the dest
    * addr is not the current pipe 0 addr we need to change pipe 0 addr in
@@ -1687,7 +1650,6 @@ int nrf24l01_sendto(FAR struct nrf24l01_dev_s *dev, FAR const uint8_t *data,
       wdbg("Pipe #0 default addr restored\n");
     }
 
-  nrf24l01_unlock(dev->spi);
   return result;
 }
 
