@@ -72,7 +72,9 @@
 /****************************************************************************
  * Pre-processor Definitions
  ****************************************************************************/
-#define CONFIG_SPI_OWNBUS 1
+#ifdef CONFIG_ARCH_BOARD_MINDPX_V2
+	#define CONFIG_SPI_OWNBUS 1
+#endif
 
 #ifndef CONFIG_WL_NRF24L01_DFLT_ADDR_WIDTH
 #  define CONFIG_WL_NRF24L01_DFLT_ADDR_WIDTH 5
